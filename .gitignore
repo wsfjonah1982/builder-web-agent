@@ -1,0 +1,5 @@
+credential.json
+_log/
+__pycache__/
+.venv/
+_generated/

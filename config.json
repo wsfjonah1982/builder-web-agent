@@ -1,0 +1,29 @@
+{
+  "agent": {
+    "base_url": "https://ark.ap-southeast.bytepluses.com/api/v3",
+    "max_upload_mb": 8,
+    "max_document_chars": 20000
+  },
+  "site": {
+    "title": "Porto Agent",
+    "host": "0.0.0.0",
+    "port": 7012
+  },
+  "project": {
+    "setting_path": "project_setting.json",
+    "default_project_id": "kino-kopi-3f9a1c98239-2026",
+    "brainstorm_url_template": "https://portobuild.tos-ap-southeast-1.bytepluses.com/brand/{project_id}/brainstorm.html",
+    "design_folder": "design"
+  },
+  "image": {
+    "model_id": "dola-seedream-5-0-pro-260628",
+    "resolution": "2K",
+    "watermark": false,
+    "max_reference_mb": 10
+  },
+  "tos": {
+    "endpoint": "tos-ap-southeast-1.bytepluses.com",
+    "region": "ap-southeast-1",
+    "key_prefix_template": "brand/{project_id}"
+  }
+}
