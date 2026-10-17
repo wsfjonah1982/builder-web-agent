@@ -1,0 +1,2 @@
+   - Match the original's format (markdown, lists, code blocks) and approximate length.
+   - If there are no medium+ issues, return the original response unchanged (fix only low issues if trivial).

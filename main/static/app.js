@@ -1,9 +1,11 @@
 // Porto Agent page: a project's Chat tab (adapted from Task Bot's app.js -
-// loads the project's Managed Agent session history, sends messages, and
-// polls for the agent's events until the session goes idle), Brainstorm
-// tab (the project's brainstorm page in an iframe; Send for Analysis copies
-// the idea selected there into the project's design folder on TOS) and
-// Design tab (every image in that folder).
+// loads the project's Managed Agent session history, sends messages, polls
+// for the agent's events until the session goes idle, and shows the guard's
+// reply categories and result buttons), Brainstorm tab (the project's
+// brainstorm page in an iframe; Send for Analysis copies the idea selected
+// there into the project's design folder on TOS), Design tab (every image
+// in that folder, the editor, and Request Analysis Report) and Analysis tab
+// (the project's analysis page in an iframe).
 (function () {
   "use strict";
 
@@ -16,7 +18,7 @@
 
   // ---------- Project / session / tabs ----------
   // Project and session live in the page URL (?project=&session=), the
-  // current tab in its hash (#chat / #brainstorm / #design).
+  // current tab in its hash (#chat / #brainstorm / #design / #analysis).
   function reloadWith(params) {
     var query = new URLSearchParams(location.search);
     Object.keys(params).forEach(function (k) {
@@ -40,18 +42,22 @@
 
   var tabs = document.querySelectorAll(".tab");
   var frame = document.getElementById("brainstormFrame");
+  var analysisFrame = document.getElementById("analysisFrame");
 
-  // The brainstorm page is served from this site (/brainstorm/<project>),
-  // not straight from TOS, so its DOM and localStorage can be read here.
-  function loadBrainstorm(force) {
-    if (!frame || !config.brainstormPage) return;
-    if (force || !frame.getAttribute("src")) {
-      frame.src = config.brainstormPage + (force ? "?t=" + Date.now() : "");
+  // The brainstorm and analysis pages are served from this site
+  // (/brainstorm/<project>, /analysis/<project>), not straight from TOS, so
+  // their DOM and localStorage can be read here.
+  function loadFrame(target, page, force) {
+    if (!target || !page) return;
+    if (force || !target.getAttribute("src")) {
+      target.src = page + (force ? "?t=" + Date.now() : "");
     }
   }
+  function loadBrainstorm(force) { loadFrame(frame, config.brainstormPage, force); }
+  function loadAnalysis(force) { loadFrame(analysisFrame, config.analysisPage, force); }
 
   function showTab(name) {
-    if (name !== "brainstorm" && name !== "design") name = "chat";
+    if (["brainstorm", "design", "analysis"].indexOf(name) === -1) name = "chat";
     tabs.forEach(function (tab) {
       var on = tab.dataset.tab === name;
       tab.classList.toggle("active", on);
@@ -59,6 +65,7 @@
       document.getElementById("panel-" + tab.dataset.tab).hidden = !on;
     });
     if (name === "brainstorm") loadBrainstorm(false);
+    else if (name === "analysis") loadAnalysis(false);
     else if (name === "design") { if (!designLoaded) loadDesign(); }
     else if (!textInput.disabled) textInput.focus();
   }
@@ -71,6 +78,16 @@
   });
   window.addEventListener("hashchange", function () { showTab(location.hash.slice(1)); });
   document.getElementById("brainstormReload").addEventListener("click", function () { loadBrainstorm(true); });
+  document.getElementById("analysisReload").addEventListener("click", function () { loadAnalysis(true); });
+
+  // Opens a tab from a reply's result button, reloading its page (the agent
+  // has just written it).
+  function openTab(name) {
+    history.replaceState(null, "", "#" + name);
+    showTab(name);
+    if (name === "brainstorm") loadBrainstorm(true);
+    else if (name === "analysis") loadAnalysis(true);
+  }
 
   // ---------- Send for Analysis ----------
   // Reads the idea selected on the brainstorm page ("Select for analysis"
@@ -191,7 +208,20 @@
     else innerEl.appendChild(node);
   }
 
-  function renderUser(text, images, attachments) {
+  // The "[Project id: ...]" block the server puts before a message until
+  // the session has been told the project id.
+  function addProjectTag(bubble, project) {
+    var tag = el("span", "file-tag project-tag", "Project: " + project);
+    tag.title = "The project id was sent to the agent with this message";
+    var files = bubble.querySelector(".msg-files");
+    if (!files) {
+      files = el("div", "msg-files");
+      bubble.insertBefore(files, bubble.firstChild);
+    }
+    files.insertBefore(tag, files.firstChild);
+  }
+
+  function renderUser(text, images, attachments, project) {
     var row = el("div", "msg msg-user");
     var bubble = el("div", "bubble");
     if (images && images.length) {
@@ -211,17 +241,97 @@
       bubble.appendChild(files);
     }
     if (text) bubble.appendChild(document.createTextNode(text));
+    if (project) addProjectTag(bubble, project);
     row.appendChild(bubble);
     appendNode(row);
+    return bubble;
+  }
+
+  // Page wording from ui_text.md (server-side), with built-in fallbacks.
+  var TEXT = config.text || {};
+  function t(key, fallback) { return TEXT[key] || fallback; }
+
+  // Hover hints for the reply categories from the response guardrail.
+  function categoryHint(category) {
+    return t("hint_" + category.toLowerCase(), "");
+  }
+
+  // A "Go" button only makes sense on the newest reply, before anything else
+  // has been sent.
+  function retireGoButtons() {
+    innerEl.querySelectorAll(".btn-go").forEach(function (b) {
+      b.disabled = true;
+      b.dataset.retired = "1";
+    });
+  }
+
+  // A result link ending in brainstorm.html / analysis.html gets "View
+  // Brainstorm" / "View Analysis", which opens that tab when it's this
+  // project's page (another project's opens in a new browser tab); any
+  // other link gets "View Output" in a new tab. The guard only passes
+  // unsigned result links on the bucket.
+  var PAGE_TABS = [
+    { tab: "brainstorm", file: "brainstorm.html", key: "view_brainstorm_button", label: "View Brainstorm" },
+    { tab: "analysis", file: "analysis.html", key: "view_analysis_button", label: "View Analysis" },
+  ];
+
+  function outputButton(url) {
+    var path = url.split(/[?#]/)[0];
+    var file = path.split("/").pop();
+    var page = PAGE_TABS.filter(function (p) { return p.file === file; })[0];
+    var btn = el("a", "btn-action btn-view",
+                 page ? t(page.key, page.label) : t("view_output_button", "View Output"));
+    btn.href = url;
+    btn.title = url;
+    if (page && config[page.tab] && path === config[page.tab]) {
+      btn.addEventListener("click", function (e) {
+        if (e.ctrlKey || e.metaKey || e.shiftKey || e.button !== 0) return;
+        e.preventDefault();
+        openTab(page.tab);
+      });
+    }
+    return btn;
   }
 
   function renderAssistant(item) {
-    var row = el("div", "msg msg-assistant");
+    var category = item.category || "";
+    retireGoButtons();
+    var row = el("div", "msg msg-assistant" + (category ? " cat-" + category.toLowerCase() : ""));
     var bubble = el("div", "bubble");
+
+    if (category) {
+      var head = el("div", "reply-label");
+      var chip = el("span", "cat-chip", category);
+      chip.title = categoryHint(category);
+      head.appendChild(chip);
+      (item.also || []).forEach(function (extra) {
+        var sub = el("span", "cat-chip cat-chip-sub cat-" + extra.toLowerCase(), extra);
+        sub.title = categoryHint(extra);
+        head.appendChild(sub);
+      });
+      bubble.appendChild(head);
+    }
+
     var body = el("div", "md");
-    // Server-rendered Markdown, HTML-escaped first.
+    // Server-rendered Markdown of the guard's rewrite, HTML-escaped first.
     body.innerHTML = item.html;
     bubble.appendChild(body);
+
+    var isGate = category === "Gate" || (item.also || []).indexOf("Gate") !== -1;
+    if (item.output_url || isGate) {
+      var actions = el("div", "reply-actions");
+      if (item.output_url) actions.appendChild(outputButton(item.output_url));
+      if (isGate) {
+        var go = el("button", "btn-action btn-go", t("go_button", "Go"));
+        go.type = "button";
+        go.disabled = sending || !!waiting;
+        go.addEventListener("click", function () {
+          if (!go.disabled) sendText(t("go_reply", "Go"));
+        });
+        actions.appendChild(go);
+      }
+      bubble.appendChild(actions);
+    }
     bubble.querySelectorAll("a[href]").forEach(function (a) {
       // Markdown links aren't URL-sanitized server-side; drop javascript: etc.
       if (!/^(https?:|mailto:)/i.test(a.getAttribute("href"))) a.removeAttribute("href");
@@ -262,7 +372,7 @@
       return !!(waiting && waiting.userTs != null && item.ts >= waiting.userTs &&
         (item.status === "idle" || item.status === "terminated"));
     }
-    if (item.kind === "user") renderUser(item.text, item.images, item.attachments);
+    if (item.kind === "user") renderUser(item.text, item.images, item.attachments, item.project);
     else if (item.kind === "assistant") renderAssistant(item);
     else if (item.kind === "error") renderError(item.text);
     return false;
@@ -364,15 +474,31 @@
 
   function updateSendState() {
     sendBtn.disabled = sending || !!waiting;
+    var lastGo = innerEl.querySelectorAll(".btn-go");
+    lastGo = lastGo[lastGo.length - 1];
+    if (lastGo && lastGo.dataset.retired !== "1") lastGo.disabled = sending || !!waiting;
   }
 
   function send() {
-    var text = textInput.value.trim();
-    var files = pendingFiles;
-    if ((!text && !files.length) || sending || waiting) return;
+    sendText(textInput.value.trim(), true);
+  }
+
+  // The agent can take a message (nothing being sent or worked on).
+  function chatReady() {
+    return !!config.session && !config.error && !sending && !waiting;
+  }
+
+  // Sends `text` (from the composer, with any pending attachments, or a
+  // quick reply such as the Go button's "Go", which leaves the composer as is).
+  // onSent runs once the agent has accepted the message, onFailed if not.
+  function sendText(text, fromComposer, onSent, onFailed) {
+    var files = fromComposer ? pendingFiles : [];
+    if ((!text && !files.length) || !chatReady()) return;
 
     var body = new FormData();
     body.append("text", text);
+    // The server puts it before the message until the session has had it.
+    if (config.project) body.append("project", config.project);
     files.forEach(function (f) { body.append("files", f); });
 
     var images = files.filter(function (f) { return /^image\//.test(f.type); })
@@ -380,13 +506,15 @@
     var otherNames = files.filter(function (f) { return !/^image\//.test(f.type); })
       .map(function (f) { return f.name; });
 
-    renderUser(text, images, otherNames);
+    var sentBubble = renderUser(text, images, otherNames);
     scrollToBottom(true);
-    var draft = { text: textInput.value, files: files.slice() };
-    textInput.value = "";
-    pendingFiles = [];
-    renderAttachments();
-    autosize();
+    var draft = fromComposer ? { text: textInput.value, files: files.slice() } : null;
+    if (fromComposer) {
+      textInput.value = "";
+      pendingFiles = [];
+      renderAttachments();
+      autosize();
+    }
 
     sending = true;
     updateSendState();
@@ -398,21 +526,26 @@
         sending = false;
         if (!res.ok) throw new Error(res.data.error || "Send failed");
         if (res.data.event_id) seen.add(res.data.event_id);
+        if (res.data.project) addProjectTag(sentBubble, res.data.project);
         waiting = { eventId: res.data.event_id, userTs: null, sentAt: Date.now() };
         updateSendState();
         schedulePoll();
+        if (onSent) setTimeout(onSent, 0);  // outside this chain: its errors aren't send failures
       })
       .catch(function (err) {
         sending = false;
         showTyping(false);
         updateSendState();
         // Restore the draft so nothing typed is lost.
-        textInput.value = draft.text;
-        pendingFiles = draft.files;
-        renderAttachments();
-        autosize();
+        if (draft) {
+          textInput.value = draft.text;
+          pendingFiles = draft.files;
+          renderAttachments();
+          autosize();
+        }
         renderError(err.message || "Send failed");
         scrollToBottom(true);
+        if (onFailed) onFailed(err);
       });
   }
 
@@ -511,6 +644,9 @@
     if (latest) head.appendChild(el("span", "design-badge", "Latest"));
     var meta = [];
     if (sel && sel.selected_at) meta.push("selected " + new Date(sel.selected_at).toLocaleString());
+    if (sel && sel.analysis_requested_at) {
+      meta.push("analysis requested " + new Date(sel.analysis_requested_at).toLocaleString());
+    }
     if (!sel) meta.push("no selection.json");
     head.appendChild(el("span", "design-sel", meta.join(" · ")));
     var where = el("span", "design-path", group.folder ? "design/" + group.folder + "/" : "design/ (top level)");
@@ -520,7 +656,68 @@
     var grid = el("div", "design-grid");
     group.images.forEach(function (img) { grid.appendChild(designFigure(img)); });
     section.appendChild(grid);
+    // Timestamp folders with a selection.json can go to the agent for the
+    // analysis report (the older top-level layout can't be marked).
+    if (group.folder && sel && sel.idea) section.appendChild(analysisRequestBar(group));
     return section;
+  }
+
+  // The message for the analysis report: the request (ui_text.md
+  // "analysis_request"), then the pick in the brainstorm page's
+  // brand-design-selection format, plus where its images are now.
+  function analysisRequestText(group) {
+    var sel = group.selection;
+    var payload = {
+      type: "brand-design-selection", version: 1, request: "analysis-report",
+      project_id: config.project, page: "design", date: new Date().toISOString(),
+      selected: { id: sel.idea.id, title: sel.idea.title, note: sel.note || "" },
+      general: sel.general || "",
+      folder: "design/" + group.folder + "/", folder_url: group.url,
+      designs: group.images.map(function (img) {
+        return { label: img.label || img.file, url: img.url.split("?")[0], edited: !!img.edited_at };
+      }),
+    };
+    return t("analysis_request", "Please write the analysis report for the design selected below.") +
+      "\n\n" + JSON.stringify(payload, null, 2);
+  }
+
+  function analysisRequestBar(group) {
+    var bar = el("div", "design-actions");
+    var btn = el("button", "btn-small", t("analysis_report_button", "Request Analysis Report"));
+    btn.type = "button";
+    var status = el("span", "send-status");
+    status.setAttribute("role", "status");
+    btn.addEventListener("click", function () {
+      if (!chatReady()) {
+        status.textContent = config.session ? "The agent is still working. Try again when it has finished."
+                                            : "This project has no chat session.";
+        status.className = "send-status send-error";
+        return;
+      }
+      var title = group.selection.idea.title;
+      if (!confirm('Send "' + title + '" (design/' + group.folder + '/) to the agent for the analysis report?')) return;
+      btn.disabled = true;
+      status.textContent = "Sending...";
+      status.className = "send-status";
+      openTab("chat");
+      sendText(analysisRequestText(group), false, function () {
+        getJson(designApi("/analysis-requested"), {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ folder: group.folder }),
+        }).then(renderFolder).catch(function (err) {
+          btn.disabled = false;
+          status.textContent = "Sent, but the request time couldn't be saved: " + err.message;
+          status.className = "send-status send-error";
+        });
+      }, function (err) {
+        btn.disabled = false;
+        status.textContent = "Not sent: " + (err.message || "send failed");
+        status.className = "send-status send-error";
+      });
+    });
+    bar.appendChild(btn);
+    bar.appendChild(status);
+    return bar;
   }
 
   function renderFolder(data) {

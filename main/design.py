@@ -281,6 +281,29 @@ def select_idea(project_id: str, brainstorm_url: str, idea_id: str, notes: dict 
     return {**list_design(project_id), "created": folder}
 
 
+def mark_analysis_requested(project_id: str, folder: str) -> dict:
+    """Record in a pick's selection.json that it was sent to the agent for
+    the analysis report ("analysis_requested_at", the latest request).
+    Returns the new folder listing."""
+    if not PICK_FOLDER_RE.match(folder or ""):
+        raise InvalidDesignName(f'Invalid design folder "{folder}".')
+    cfg = tos_config()
+    _require_credentials(cfg)
+    sel_key = design_prefix(project_id, cfg) + folder + "/" + SELECTION_FILE
+    selection = _read_selection(sel_key, cfg)
+    if not selection:
+        raise DesignError(f'design/{folder}/ has no {SELECTION_FILE}.')
+    selection["analysis_requested_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        tos_client.put_object(cfg["endpoint"], cfg["region"], cfg["bucket"], sel_key,
+                              cfg["access_key"], cfg["secret_key"],
+                              json.dumps(selection, ensure_ascii=False, indent=2).encode("utf-8"),
+                              "application/json; charset=utf-8", CACHE_CONTROL)
+    except (RuntimeError, requests.RequestException) as e:
+        raise DesignError(f"Updating {SELECTION_FILE} failed: {e}") from e
+    return list_design(project_id)
+
+
 # ---------- Editing a design image ----------
 
 DESIGN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")

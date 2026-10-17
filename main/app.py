@@ -2,13 +2,18 @@
 
 A single-page, no-login Flask site for one PortoBuild project, adapted from
 Task Bot (web_app/task-bot). The page takes a project id (`?project=<id>`,
-or config.json["project"]["default_project_id"]) and has three tabs:
+or config.json["project"]["default_project_id"]) and has four tabs:
 
 - Chat: talks to the BytePlus Ark Managed Agent session the project maps to
   in project_setting.json (`?session=<id>` overrides it). As in Task Bot, the
   history is read straight from the session's REST event history (nothing is
   stored locally), a message is posted as a user.message event, and the page
-  polls for the agent's events until the session goes back to idle.
+  polls for the agent's events until the session goes back to idle. Every
+  agent reply passes through Task Bot's response guardrail (guard/) first:
+  it is reviewed for sensitive content, rewritten if needed, and labelled
+  with a reply category (Done / Gate / WFT / Answer / Progress / Fail). The
+  original text is never sent to the page; results are cached per event
+  under _evaluations/.
 - Brainstorm: shows the project's brainstorm page on object storage
   (config.json["project"]["brainstorm_url_template"]) in an iframe. The
   page is fetched server-side and served from this site (/brainstorm/<id>,
@@ -19,16 +24,23 @@ or config.json["project"]["default_project_id"]) and has three tabs:
   folder, newest first, filled by the Brainstorm tab's "Send for Analysis"
   (design.py). Each image can be edited (canvas tools, crop and Seedream,
   adapted from jonah-image-editor; seedream.py, static/editor.js) and saved
-  back over itself.
+  back over itself, and each group can be sent to the agent in the chat for
+  the analysis report ("Request Analysis Report").
+- Analysis: shows the project's analysis page
+  (config.json["project"]["analysis_url_template"]) the same way as the
+  Brainstorm tab (/analysis/<id>).
 """
 
 import base64
 import html
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import markdown
@@ -38,15 +50,18 @@ from markupsafe import Markup
 from werkzeug.utils import secure_filename
 
 import design
+import guard
 import managed_agent
 import seedream
 
 MAIN_DIR = Path(__file__).resolve().parent
 BASE_DIR = MAIN_DIR.parent
 sys.path.insert(0, str(BASE_DIR))
-from util.log_utils import get_app_logger, log_conversation_turn  # noqa: E402
+from util.log_utils import get_app_logger, log_conversation_turn, log_guard_review  # noqa: E402
 
 CONFIG_FILE = BASE_DIR / "config.json"
+EVALUATIONS_DIR = BASE_DIR / "_evaluations"
+UI_TEXT_FILE = BASE_DIR / "ui_text.md"
 
 logger = get_app_logger()
 app = Flask(__name__)
@@ -62,6 +77,9 @@ ALLOWED_EXTENSIONS = set(MOUNTABLE_MIME) | INLINE_TEXT_EXTENSIONS
 # attachments - hidden from the rendered bubble and shown as chips instead.
 UPLOAD_NOTE_RE = re.compile(r"^\[Uploaded file available at (?P<path>[^\]]+)\]$")
 ATTACHED_NOTE_RE = re.compile(r"^\[Attached file: (?P<name>[^\]]+)\]\n")
+# Leads the next message until the session has been told the project id.
+PROJECT_NOTE = "[Project id: {project_id}]"
+PROJECT_NOTE_RE = re.compile(r"^\[Project id: (?P<id>[^\]]+)\]$")
 SESSION_ID_RE = re.compile(r"^sesn-[A-Za-z0-9-]{1,64}$")
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -81,6 +99,59 @@ def _root_config() -> dict:
     return json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.is_file() else {}
 
 
+def guard_config() -> dict:
+    cfg = _root_config().get("guard", {})
+    cfg.setdefault("enabled", True)
+    cfg.setdefault("max_parallel_reviews", 4)
+    return cfg
+
+
+# Page wording, editable in ui_text.md; these are the fallbacks for any key
+# missing there.
+DEFAULT_UI_TEXT = {
+    "view_output_button": "View Output",
+    "view_brainstorm_button": "View Brainstorm",
+    "view_analysis_button": "View Analysis",
+    "analysis_report_button": "Request Analysis Report",
+    "analysis_request": "Please write the analysis report for the design selected below and publish it as "
+                        "analysis.html: look at its images in the design folder (including the ones I "
+                        "edited), rank it against the other ideas, and give the reasons for the ranking.",
+    "go_button": "Go",
+    "go_reply": "Go",
+    "review_failed_notice": "This reply couldn't be checked right now, so it's hidden. "
+                            "Reload the page in a moment to try again.",
+    "hint_done": "Result delivered",
+    "hint_gate": "Waiting for your go-ahead",
+    "hint_wft": "Waiting for your input",
+    "hint_answer": "Complete answer",
+    "hint_progress": "Still working",
+    "hint_fail": "Couldn't complete the request",
+    "hint_unchecked": "This reply couldn't be checked",
+}
+_ui_text_cache: dict = {"mtime": None, "text": DEFAULT_UI_TEXT}
+
+
+def ui_text() -> dict:
+    """DEFAULT_UI_TEXT overlaid with ui_text.md, where each `## key` heading
+    starts an item and the text under it is the value. Re-read whenever the
+    file changes."""
+    try:
+        mtime = UI_TEXT_FILE.stat().st_mtime
+    except OSError:
+        return DEFAULT_UI_TEXT
+    if _ui_text_cache["mtime"] != mtime:
+        text, key, lines = dict(DEFAULT_UI_TEXT), None, []
+        for line in UI_TEXT_FILE.read_text(encoding="utf-8").splitlines() + ["## "]:
+            if line.startswith("## "):
+                if key in DEFAULT_UI_TEXT and "\n".join(lines).strip():
+                    text[key] = "\n".join(lines).strip()
+                key, lines = line[3:].strip(), []
+            elif key is not None:
+                lines.append(line)
+        _ui_text_cache.update(mtime=mtime, text=text)
+    return _ui_text_cache["text"]
+
+
 def site_config() -> dict:
     cfg = _root_config().get("site", {})
     cfg.setdefault("title", "Porto Agent")
@@ -95,13 +166,15 @@ def project_config() -> dict:
     cfg.setdefault("default_project_id", "")
     cfg.setdefault("brainstorm_url_template",
                    "https://portobuild.tos-ap-southeast-1.bytepluses.com/brand/{project_id}/brainstorm.html")
+    cfg.setdefault("analysis_url_template",
+                   "https://portobuild.tos-ap-southeast-1.bytepluses.com/brand/{project_id}/analysis.html")
     return cfg
 
 
 def project_settings() -> dict:
     """project_setting.json["projects"]: project id -> {"session_id", and
-    optionally "brainstorm_url"}. Re-read on every call, so edits apply
-    without a restart."""
+    optionally "brainstorm_url" / "analysis_url"}. Re-read on every call, so
+    edits apply without a restart."""
     path = BASE_DIR / project_config()["setting_path"]
     try:
         return json.loads(path.read_text(encoding="utf-8")).get("projects", {})
@@ -111,16 +184,19 @@ def project_settings() -> dict:
 
 
 def resolve_project(project_id: str) -> dict:
-    """The project's session id and brainstorm page URL. Raises ValueError
-    for a malformed id; an id missing from project_setting.json resolves to
-    no session (the brainstorm page can still be shown)."""
+    """The project's session id and brainstorm / analysis page URLs. Raises
+    ValueError for a malformed id; an id missing from project_setting.json
+    resolves to no session (the pages can still be shown)."""
     if not PROJECT_ID_RE.match(project_id):
         raise ValueError(f'Invalid project id "{project_id}".')
     entry = project_settings().get(project_id) or {}
-    brainstorm_url = entry.get("brainstorm_url") or \
-        project_config()["brainstorm_url_template"].format(project_id=project_id)
+    cfg = project_config()
     return {"project_id": project_id, "session_id": entry.get("session_id") or "",
-            "brainstorm_url": brainstorm_url, "known": bool(entry)}
+            "brainstorm_url": entry.get("brainstorm_url") or
+            cfg["brainstorm_url_template"].format(project_id=project_id),
+            "analysis_url": entry.get("analysis_url") or
+            cfg["analysis_url_template"].format(project_id=project_id),
+            "known": bool(entry)}
 
 
 def markdown_filter(text: str) -> Markup:
@@ -182,6 +258,16 @@ def _image_src(block: dict) -> str | None:
     return None
 
 
+def _project_note_of(e: dict) -> str | None:
+    """The project id a user.message event was led with, if any."""
+    if e.get("type") != "user.message":
+        return None
+    for b in e.get("content") or []:
+        if b.get("type") == "text" and (m := PROJECT_NOTE_RE.match(b.get("text", "").strip())):
+            return m.group("id")
+    return None
+
+
 def event_to_item(e: dict) -> dict | None:
     """Convert one raw Managed Agent event into a render-ready item, or None
     for events with nothing to show (span.*, agent.thinking, and tool calls
@@ -193,11 +279,13 @@ def event_to_item(e: dict) -> dict | None:
         return {**base, "kind": "status", "status": STATUS_EVENTS[t]}
 
     if t == "user.message":
-        texts, images, attachments = [], [], []
+        texts, images, attachments, project = [], [], [], None
         for b in e.get("content") or []:
             if b.get("type") == "text":
                 text = b.get("text", "")
-                if m := UPLOAD_NOTE_RE.match(text.strip()):
+                if m := PROJECT_NOTE_RE.match(text.strip()):
+                    project = m.group("id")
+                elif m := UPLOAD_NOTE_RE.match(text.strip()):
                     attachments.append(m.group("path").rsplit("/", 1)[-1])
                 elif m := ATTACHED_NOTE_RE.match(text):
                     attachments.append(m.group("name"))
@@ -212,13 +300,15 @@ def event_to_item(e: dict) -> dict | None:
         text = "\n\n".join(t for t in texts if t)
         if not (text or images or attachments):
             return None
-        return {**base, "kind": "user", "text": text, "images": images, "attachments": attachments}
+        return {**base, "kind": "user", "text": text, "images": images, "attachments": attachments,
+                "project": project}
 
     if t == "agent.message":
         text = "".join(b.get("text", "") for b in e.get("content") or [] if b.get("type") == "text")
         if not text:
             return None
-        return {**base, "kind": "assistant", "html": str(markdown_filter(text))}
+        # "_text" is consumed by _apply_guard() and never sent to the page.
+        return {**base, "kind": "assistant", "_text": text}
 
     if t == "session.error":
         err = e.get("error") or {}
@@ -228,8 +318,106 @@ def event_to_item(e: dict) -> dict | None:
     return None
 
 
+# ---------- Response guardrail (from Task Bot) ----------
+
+def _evaluation_path(sid: str, event_id: str) -> Path:
+    return EVALUATIONS_DIR / sid / f"{secure_filename(event_id)}.json"
+
+
+def _last_question_path(sid: str) -> Path:
+    return EVALUATIONS_DIR / sid / "_last_question.json"
+
+
+def _load_json_file(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _save_json_atomic(path: Path, data) -> None:
+    """Write to a temp file then rename, so a concurrent reader never sees a
+    half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _evaluate_reply(sid: str, event_id: str, text: str, question: str) -> dict | None:
+    """Run the guard on one agent reply, or return its cached result.
+    Returns None if the review could not be completed."""
+    cached = _load_json_file(_evaluation_path(sid, event_id))
+    if cached:
+        return cached
+    cfg = guard_config()
+    policy = {}
+    if cfg.get("policy_path"):
+        policy = _load_json_file(BASE_DIR / cfg["policy_path"]) or {}
+    try:
+        result = guard.evaluate(text, question, cfg, managed_agent.api_key(),
+                                managed_agent.load_agent_config()["base_url"], policy)
+    except Exception as e:  # noqa: BLE001 - any failure must hide the reply, never leak it
+        logger.warning("guard review failed for %s/%s: %s", sid, event_id, e)
+        log_guard_review(session_id=sid, event_id=event_id, status="failed", error=str(e))
+        return None
+    _save_json_atomic(_evaluation_path(sid, event_id), result)
+    # Metrics only - never the reply text.
+    metrics = {k: result[k] for k in ("verdict", "original_score", "rewritten_score", "counts",
+                                      "also", "expects_go", "review_passes", "tokens_total", "elapsed_s", "model")}
+    metrics["category"] = result["status"]  # "status" is the log entry's own succeeded/failed field
+    metrics["has_output_url"] = bool(result["output_url"])
+    log_guard_review(session_id=sid, event_id=event_id, status="succeeded", metrics=metrics)
+    return result
+
+
+def _apply_guard(items: list, sid: str) -> None:
+    """In place: replace each assistant item's raw text with the guard's
+    rewritten text, reply category and actions. The context given to the
+    review is the latest user message before the reply."""
+    cfg = guard_config()
+    jobs, question = [], None
+    for item in items:
+        if item["kind"] == "user":
+            question = item["text"]
+        elif item["kind"] == "assistant":
+            if question is None:  # polling window starts mid-turn - use the last message sent
+                question = (_load_json_file(_last_question_path(sid)) or {}).get("text", "")
+            jobs.append((item, question))
+
+    if not cfg["enabled"]:
+        for item, _ in jobs:
+            item["html"] = str(markdown_filter(item.pop("_text")))
+        return
+
+    def run(job):
+        item, q = job
+        return _evaluate_reply(sid, item["id"] or uuid.uuid4().hex, item["_text"], q)
+
+    with ThreadPoolExecutor(max_workers=max(1, int(cfg["max_parallel_reviews"]))) as pool:
+        results = list(pool.map(run, jobs))
+
+    for (item, _), result in zip(jobs, results):
+        item.pop("_text")
+        if result is None:
+            item.update({"html": str(markdown_filter(ui_text()["review_failed_notice"])),
+                         "category": "Unchecked", "also": []})
+            continue
+        item.update({
+            "html": str(markdown_filter(result["text"])),
+            "category": result["status"],
+            "also": result["also"],
+            "verdict": result["verdict"],
+            # Reviews cached before find_links() dropped Markdown emphasis can
+            # still end in "**".
+            "output_url": (result["output_url"] or "").rstrip(".,;:!?*_~"),
+        })
+
+
 def _events_payload(events: list, sid: str) -> dict:
     items = [i for i in (event_to_item(e) for e in events) if i]
+    _apply_guard(items, sid)
     cursor = next((e["processed_at"] for e in reversed(events) if e.get("processed_at")), None)
     try:
         status = managed_agent.get_session(sid).get("status", "unknown")
@@ -242,7 +430,8 @@ def _events_payload(events: list, sid: str) -> dict:
 @app.route("/")
 def index():
     project_id = (request.args.get("project") or project_config()["default_project_id"]).strip()
-    error, project = "", {"project_id": project_id, "session_id": "", "brainstorm_url": "", "known": False}
+    error, project = "", {"project_id": project_id, "session_id": "", "brainstorm_url": "",
+                          "analysis_url": "", "known": False}
     if project_id:
         try:
             project = resolve_project(project_id)
@@ -267,6 +456,7 @@ def index():
         agent_name=(agent.get("name") or "Agent").replace("_", " "),
         agent_description=agent.get("description") or "",
         error=error,
+        ui_text={k: v for k, v in ui_text().items() if k != "review_failed_notice"},
     ), 400 if error else 200
 
 
@@ -286,29 +476,41 @@ def _project_or_400(project_id: str):
 
 
 BASE_RE = re.compile(r"""<base\b[^>]*>""", re.I)
-MAX_BRAINSTORM_BYTES = 5 * 1024 * 1024
+MAX_PROJECT_PAGE_BYTES = 5 * 1024 * 1024
 
 
 @app.route("/brainstorm/<project_id>")
 def brainstorm_page(project_id: str):
     """The project's brainstorm page, served from this site's origin so the
     Brainstorm tab can read the idea selected in it (its DOM and its
-    localStorage are then this site's). A <base href> at the page's real
-    URL keeps its relative images and links pointing at TOS."""
+    localStorage are then this site's)."""
+    return _project_page(project_id, "brainstorm")
+
+
+@app.route("/analysis/<project_id>")
+def analysis_page(project_id: str):
+    """The project's analysis page, for the Analysis tab."""
+    return _project_page(project_id, "analysis")
+
+
+def _project_page(project_id: str, kind: str) -> Response:
+    """Fetch the project's `<kind>_url` page from TOS and serve it from this
+    site. A <base href> at the page's real URL keeps its relative images and
+    links pointing at TOS."""
     try:
         project = resolve_project(project_id)
     except ValueError as e:
         return Response(html.escape(str(e)), status=400, mimetype="text/plain")
     try:
-        r = requests.get(project["brainstorm_url"], timeout=20, headers={"Cache-Control": "no-cache"})
+        r = requests.get(project[f"{kind}_url"], timeout=20, headers={"Cache-Control": "no-cache"})
         r.raise_for_status()
-        if len(r.content) > MAX_BRAINSTORM_BYTES:
-            raise ValueError("The brainstorm page is too large.")
+        if len(r.content) > MAX_PROJECT_PAGE_BYTES:
+            raise ValueError(f"The {kind} page is too large.")
     except (requests.RequestException, ValueError) as e:
-        logger.warning("brainstorm page fetch failed for %s: %s", project_id, e)
+        logger.warning("%s page fetch failed for %s: %s", kind, project_id, e)
         status = getattr(getattr(e, "response", None), "status_code", None)
-        message = ("This project has no brainstorm page yet." if status == 404
-                   else "The brainstorm page couldn't be loaded.")
+        message = (f"This project has no {kind} page yet." if status == 404
+                   else f"The {kind} page couldn't be loaded.")
         return Response(f"<!doctype html><meta charset=utf-8><p style='font:15px system-ui;padding:24px'>"
                         f"{html.escape(message)}</p>", status=502, mimetype="text/html")
     r.encoding = r.encoding if "charset" in r.headers.get("Content-Type", "") else "utf-8"
@@ -454,6 +656,25 @@ def api_design_select(project_id: str):
     return jsonify(result)
 
 
+@app.route("/api/design/<project_id>/analysis-requested", methods=["POST"])
+def api_design_analysis_requested(project_id: str):
+    """Called by the Design tab after it has sent a pick to the agent for
+    the analysis report: notes the time in the pick's selection.json."""
+    project, err = _project_or_400(project_id)
+    if err:
+        return err
+    folder = str((request.get_json(silent=True) or {}).get("folder") or "").strip()
+    try:
+        result = design.mark_analysis_requested(project_id, folder)
+    except design.InvalidDesignName as e:
+        return jsonify({"error": str(e)}), 400
+    except design.DesignError as e:
+        logger.warning("analysis request mark failed for %s/%s: %s", project_id, folder, e)
+        return jsonify({"error": str(e)}), 502
+    logger.info("design %s/%s sent for the analysis report", project_id, folder)
+    return jsonify(result)
+
+
 @app.route("/api/history")
 def api_history():
     try:
@@ -502,6 +723,9 @@ def api_message():
         sid = resolve_session_id()
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    project_id = (request.form.get("project") or "").strip()
+    if project_id and not PROJECT_ID_RE.match(project_id):
+        return jsonify({"error": f'Invalid project id "{project_id}".'}), 400
 
     cfg = managed_agent.load_agent_config()
     max_bytes = int(cfg["max_upload_mb"]) * 1024 * 1024
@@ -531,15 +755,37 @@ def api_message():
                 doc_text = doc_text[:max_doc_chars] + "\n... (truncated)"
             content.append({"type": "text", "text": f"[Attached file: {filename}]\n{doc_text}"})
 
+    # Until the session has been told this project id (including sessions
+    # started elsewhere), lead the message with it.
+    project_sent = False
+    if project_id:
+        try:
+            told = any(_project_note_of(e) == project_id for e in managed_agent.get_events(sid=sid))
+        except managed_agent.ManagedAgentError as e:
+            logger.warning("history check before send failed: %s", e)
+            return jsonify({"error": f"Could not reach the session: {e}"}), 502
+        if not told:
+            content.insert(0, {"type": "text", "text": PROJECT_NOTE.format(project_id=project_id)})
+            project_sent = True
+
     try:
         data = managed_agent.send_message(content, sid)
     except managed_agent.ManagedAgentError as e:
         logger.warning("send message failed: %s", e)
         return jsonify({"error": f"Agent call failed: {e}"}), 502
 
+    if project_sent:
+        logger.info("project id %s sent to session %s", project_id, sid)
+    # Context for reviewing replies whose polling window starts mid-turn.
+    if text:
+        try:
+            _save_json_atomic(_last_question_path(sid), {"text": text})
+        except OSError as e:
+            logger.warning("failed to save last question: %s", e)
     log_conversation_turn(session_id=sid, role="user", text=text, attachments=attachment_names)
     created = (data.get("data") or [{}])[0]
-    return jsonify({"event_id": created.get("id"), "sent_at": int(time.time() * 1000)})
+    return jsonify({"event_id": created.get("id"), "sent_at": int(time.time() * 1000),
+                    "project": project_id if project_sent else None})
 
 
 if __name__ == "__main__":

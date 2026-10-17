@@ -11,8 +11,9 @@
   },
   "project": {
     "setting_path": "project_setting.json",
-    "default_project_id": "kino-kopi-3f9a1c98239-2026",
+    "default_project_id": "brand-2026101714",
     "brainstorm_url_template": "https://portobuild.tos-ap-southeast-1.bytepluses.com/brand/{project_id}/brainstorm.html",
+    "analysis_url_template": "https://portobuild.tos-ap-southeast-1.bytepluses.com/brand/{project_id}/analysis.html",
     "design_folder": "design"
   },
   "image": {
@@ -25,5 +26,28 @@
     "endpoint": "tos-ap-southeast-1.bytepluses.com",
     "region": "ap-southeast-1",
     "key_prefix_template": "brand/{project_id}"
+  },
+  "guard": {
+    "enabled": true,
+    "chat_model_id": "deepseek-v4-flash-260425",
+    "chat_temperature": 0.1,
+    "chat_max_tokens": 8192,
+    "chat_timeout_seconds": 120,
+    "chat_json_mode": true,
+    "policy_path": "policy.json",
+    "audience": "external",
+    "max_review_passes": 2,
+    "severity_deduction": {
+      "critical": 40,
+      "high": 25,
+      "medium": 10,
+      "low": 3
+    },
+    "pass_threshold": 85,
+    "visible_redaction_markers": false,
+    "rewrite_style": "concise",
+    "result_link_pattern": "https?://[\\w.-]*\\btos-[\\w-]+\\.(?:bytepluses|volces)\\.com/[^\\s)<>\"'`\\]]+",
+    "block_fallback_message": "Thanks for your message. I'm not able to share that here, but I can help with something else - just let me know.",
+    "max_parallel_reviews": 4
   }
 }

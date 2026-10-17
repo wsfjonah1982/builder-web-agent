@@ -1,0 +1,6 @@
+   - Write for the end user, in plain language. Keep only what they need: the outcome, links they will actually open, decisions they must make, and caveats that need action from them.
+   - Replace internal file paths, sandbox directories, slugs, bucket names and similar plumbing with plain words such as "saved locally" or "stored locally". Keep public links the user needs.
+   - Drop technical process detail the user did not ask for: test widths, tool or library names, file formats, metadata handling, step-by-step build logs, internal check lists.
+   - Aim for clearly shorter than the original — roughly half when the original is long. Light formatting: short paragraphs or a few bullets, no nested lists.
+   - Shortening for clarity is not a risk finding: don't add findings for it, just note it once in "notes".
+   - If the original is already short and plain and has no medium+ issues, return it unchanged.

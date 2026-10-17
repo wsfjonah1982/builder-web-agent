@@ -3,10 +3,11 @@
 A single-page, no-login web app for one PortoBuild project, adapted from
 Task Bot (`web_app/task-bot`): same `config.json`/`credential.json` split,
 `main/` + `util/` layout, `managed_agent.py` Ark client and `_log/` JSON-line
-logging. Task Bot's response guardrail and output viewer are not included.
+logging, and Task Bot's response guardrail (see Chat). Task Bot's output
+viewer is not included.
 
 Open it with a project id:
-`http://127.0.0.1:7012/?project=kino-kopi-3f9a1c98239-2026`
+`http://127.0.0.1:7012/?project=brand-2026101714`
 (without `?project=`, `config.json` → `project.default_project_id` is used).
 
 ## Project → session
@@ -15,15 +16,16 @@ Open it with a project id:
 ```json
 {
   "projects": {
-    "kino-kopi-3f9a1c98239-2026": { "session_id": "sesn-20261008122736-peq7j" }
+    "brand-2026101711": { "session_id": "sesn-20261017032943-0n965" },
+    "brand-2026101714": { "session_id": "sesn-20261017065630-8gntu" }
   }
 }
 ```
 
-An entry can also set `brainstorm_url` to override the URL template. The
+An entry can also set `brainstorm_url` or `analysis_url` to override the URL templates. The
 file is re-read on every request, so new projects work without a restart.
-`GET /api/project/<project_id>` returns the resolved session and brainstorm
-URL as JSON.
+`GET /api/project/<project_id>` returns the resolved session, brainstorm and analysis
+URLs as JSON.
 
 ## Tabs
 - **Chat**: shows the session the project maps to; the session bar lets you
@@ -33,6 +35,36 @@ URL as JSON.
   event, and the page polls `/api/events?since=` every 2 s until the session
   goes idle. Images/PDF are uploaded and mounted at
   `/mnt/session/uploads/<name>`; `.txt/.md/.csv/.json` are inlined as text.
+  Until a session's history contains a `[Project id: <project_id>]` block
+  (so also for sessions started elsewhere), the next message sent from this
+  page starts with one, so the agent knows the project; the page shows it
+  as a "Project" tag on that message. After that, messages go as typed.
+
+  Every agent reply goes through `main/guard/` (copied from Task
+  Bot; `find_links` also drops Markdown emphasis such as `**` around a
+  link) before it reaches the page: a pattern scan plus a DeepSeek V4 Flash
+  review that rewrites anything sensitive (Ark IDs, keys, sandbox paths,
+  agent internals; concise style), or replaces the reply with
+  `block_fallback_message` if it's still unsafe. Each reply gets a category,
+  **Fail -> Done -> Gate -> WFT -> Answer -> Progress** (first match wins;
+  Gate/WFT can also show as a second label), shown as a coloured label.
+  **Done** adds a button for the result link (unsigned TOS links only): a
+  link ending in `brainstorm.html` shows **View Brainstorm** and one ending
+  in `analysis.html` **View Analysis**, which open (and reload) the
+  Brainstorm / Analysis tab when the link is this project's page (another
+  project's opens in a new browser tab); any other link shows **View
+  Output**, which opens it in a new tab; **Gate** adds **Go**, which replies "Go" (newest
+  reply only). Only the rewrite reaches the browser. A failed review hides
+  the reply with an "Unchecked" notice and is retried on the next load.
+  Results are cached per event in `_evaluations/<session>/`, so each reply
+  is reviewed once (~5-60 s; a session's first load reviews its whole
+  history in parallel); metrics (never text) go to `_log/guard_<date>.log`.
+  `policy.json` (gitignored) lists PortoBuild's confidential terms (this
+  agent's Ark IDs, the environment's TOS access key id), the public
+  `portobuild` host, and extra rules; without it the review uses generic
+  judgement. Cached reviews aren't redone when it changes - delete
+  `_evaluations/<session>/` for that. Button labels, category hints and the
+  Unchecked notice are in `ui_text.md` (one `## key` per item, no restart).
 - **Brainstorm**: shows
   `config.json` → `project.brainstorm_url_template` with `{project_id}`
   filled in (e.g.
@@ -79,11 +111,30 @@ URL as JSON.
   format (JPEG for `.jpg`), and records `edited_at` for it in that folder's
   `selection.json`. Other picks are not touched.
 
+  When a group is ready (edits done), **Request Analysis Report** under it
+  (after a confirmation) sends the agent one chat message: the request from
+  `ui_text.md` → `analysis_request` (write the analysis report for this
+  design, rank it against the other ideas with the reasons, and publish it
+  as `analysis.html`), then the pick in the brainstorm page's
+  `brand-design-selection` JSON (`"request": "analysis-report"`, idea,
+  notes, the group's folder and each image's URL with `edited`). It goes
+  through the Chat tab like a typed message (project id note, guard,
+  polling) and the page switches to Chat; it isn't sent while the agent is
+  still working. Once the agent has accepted it, the time is saved as
+  `analysis_requested_at` in that group's `selection.json` and shown on the
+  group. The agent's reply linking `analysis.html` gets **View Analysis**.
+
   TOS sends no CORS headers, so the editor loads images through this site
   (`/api/design/<project_id>/file/<name>`); a canvas that drew them straight
   from TOS couldn't be exported.
 
-The current tab is kept in the URL hash (`#chat` / `#brainstorm` / `#design`).
+- **Analysis**: shows `config.json` → `project.analysis_url_template`
+  (`.../brand/<project_id>/analysis.html`; an entry in
+  `project_setting.json` can set `analysis_url`) the same way as the
+  Brainstorm tab, served from this site at `/analysis/<project_id>`, loaded
+  the first time the tab is opened; **Reload** fetches it again.
+
+The current tab is kept in the URL hash (`#chat` / `#brainstorm` / `#design` / `#analysis`).
 
 Design API: `GET /api/design/<project_id>` (`groups`, newest first: each
 `folder`, `images`, `selection`), `GET`/`PUT /api/design/<project_id>/file/<folder>/<file>`
@@ -91,18 +142,21 @@ Design API: `GET /api/design/<project_id>` (`groups`, newest first: each
 just `<file>` for the top-level group), `POST /api/design/<project_id>/generate`
 (Seedream; multipart `prompt`, `image`, `reference`, `width`, `height`),
 `GET /generated/<project_id>/<name>`, `POST /api/design/<project_id>/select`
-with `{"idea_id": "3"}` (the listing plus `created`, the new folder). TOS calls go through `main/tos_client.py`, copied
+with `{"idea_id": "3"}` (the listing plus `created`, the new folder),
+`POST /api/design/<project_id>/analysis-requested` with `{"folder": "<YYYYMMDD-HHMMSS>"}`
+(saves `analysis_requested_at`; returns the listing). TOS calls go through `main/tos_client.py`, copied
 from builder-brand-design (signed TOS4-HMAC-SHA256, no SDK).
 
 ## Configuration
 - `config.json` → `agent.base_url`, upload limits; `site.title/host/port`
   (default `0.0.0.0:7012`); `project.setting_path`, `default_project_id`,
-  `brainstorm_url_template`, `design_folder` (default `design`);
+  `brainstorm_url_template`, `analysis_url_template`, `design_folder` (default `design`);
   `tos.endpoint/region/key_prefix_template` (`brand/{project_id}`).
   `image.model_id` (`dola-seedream-5-0-pro-260628`), `resolution`, `watermark`,
-  `max_reference_mb` for the Seedream editor.
-- `credential.json` (gitignored) → `agent_ark_key`, `model_ark_key` (Seedream; falls
-  back to `agent_ark_key`), plus `tos_access_key_id`,
+  `max_reference_mb` for the Seedream editor. `guard` (same settings as Task
+  Bot's; `enabled: false` turns the review off and shows replies as written).
+- `credential.json` (gitignored) → `agent_ark_key` (also used for the guard's
+  review calls), `model_ark_key` (Seedream; falls back to `agent_ark_key`), plus `tos_access_key_id`,
   `tos_secret_access_key`, `tos_bucket` (same as builder-brand-design's).
 
 There is no login: anyone who can reach the port can chat with any session,
@@ -114,4 +168,5 @@ or `cd main && python app.py`, then open http://127.0.0.1:7012.
 
 ## Logs
 `_log/app_<date>.log`, `_log/agent_<date>.log` (every Ark API call),
-`_log/conversation_<date>.log` (messages sent from this page).
+`_log/conversation_<date>.log` (messages sent from this page),
+`_log/guard_<date>.log` (one line per reply review, metrics only).

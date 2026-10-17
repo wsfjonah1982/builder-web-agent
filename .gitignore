@@ -3,3 +3,5 @@ _log/
 __pycache__/
 .venv/
 _generated/
+_evaluations/
+policy.json

@@ -6,6 +6,8 @@ day (UTC) per type:
     _log/conversation_<YYYYMMDD>.log  one JSON line per user message sent
     _log/agent_<YYYYMMDD>.log         every Ark Managed Agent API call's input
                                        and output (one JSON object per line)
+    _log/guard_<YYYYMMDD>.log         one JSON line per reply review (metrics,
+                                       never the reply text)
 """
 
 import json
@@ -20,6 +22,7 @@ LOG_DIR.mkdir(exist_ok=True)
 
 _agent_log_lock = Lock()
 _conversation_log_lock = Lock()
+_guard_log_lock = Lock()
 
 
 def _today() -> str:
@@ -79,3 +82,11 @@ def log_conversation_turn(*, session_id: str, role: str, text: str, attachments:
         "session_id": session_id, "role": role, "text": text, "attachments": attachments or [],
     })
 
+
+def log_guard_review(*, session_id: str, event_id: str, status: str, metrics: dict | None = None,
+                     error: str | None = None) -> None:
+    _append_json_line("guard", _guard_log_lock, {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "session_id": session_id, "event_id": event_id, "status": status,
+        **(metrics or {}), **({"error": error} if error else {}),
+    })

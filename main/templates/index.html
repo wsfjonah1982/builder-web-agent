@@ -25,6 +25,7 @@
       <button type="button" class="tab" role="tab" id="tab-chat" data-tab="chat" aria-controls="panel-chat">Chat</button>
       <button type="button" class="tab" role="tab" id="tab-brainstorm" data-tab="brainstorm" aria-controls="panel-brainstorm">Brainstorm</button>
       <button type="button" class="tab" role="tab" id="tab-design" data-tab="design" aria-controls="panel-design">Design</button>
+      <button type="button" class="tab" role="tab" id="tab-analysis" data-tab="analysis" aria-controls="panel-analysis">Analysis</button>
     </nav>
   </header>
 
@@ -35,7 +36,7 @@
         <label for="sessionInput">Session</label>
         <input id="sessionInput" value="{{ project.session_id }}" placeholder="sesn-..." spellcheck="false">
         <button type="submit" class="btn-small">Connect</button>
-        <span class="session-note" id="sessionNote">{% if project.known %}from project_setting.json{% elif project.project_id %}project not in project_setting.json{% endif %}</span>
+        <span class="session-note">{% if project.known %}from project_setting.json{% elif project.project_id %}project not in project_setting.json{% endif %}</span>
       </form>
     </div>
 
@@ -73,7 +74,7 @@
   <section class="panel panel-brainstorm" id="panel-brainstorm" role="tabpanel" aria-labelledby="tab-brainstorm" hidden>
     <div class="session-bar">
       <div class="brainstorm-bar">
-        <span class="brainstorm-url" id="brainstormUrl" title="{{ project.brainstorm_url }}">{{ project.brainstorm_url or "No project loaded" }}</span>
+        <span class="brainstorm-url" title="{{ project.brainstorm_url }}">{{ project.brainstorm_url or "No project loaded" }}</span>
         <span class="send-status" id="sendStatus" role="status"></span>
         <button type="button" class="btn-small btn-ghost" id="brainstormReload"{% if not project.brainstorm_url %} disabled{% endif %}>Reload</button>
         <button type="button" class="btn-small" id="sendAnalysis"{% if not project.brainstorm_url or error %} disabled{% endif %}>Send for Analysis</button>
@@ -84,6 +85,23 @@
       <iframe class="brainstorm-frame" id="brainstormFrame" title="Brainstorm for {{ project.project_id }}"></iframe>
       {% else %}
       <div class="empty"><p>Enter a project id above to load its brainstorm page.</p></div>
+      {% endif %}
+    </div>
+  </section>
+
+  <!-- ---------- Analysis tab ---------- -->
+  <section class="panel panel-brainstorm" id="panel-analysis" role="tabpanel" aria-labelledby="tab-analysis" hidden>
+    <div class="session-bar">
+      <div class="brainstorm-bar">
+        <span class="brainstorm-url" title="{{ project.analysis_url }}">{{ project.analysis_url or "No project loaded" }}</span>
+        <button type="button" class="btn-small btn-ghost" id="analysisReload"{% if not project.analysis_url %} disabled{% endif %}>Reload</button>
+      </div>
+    </div>
+    <div class="frame-wrap">
+      {% if project.analysis_url %}
+      <iframe class="brainstorm-frame" id="analysisFrame" title="Analysis for {{ project.project_id }}"></iframe>
+      {% else %}
+      <div class="empty"><p>Enter a project id above to load its analysis page.</p></div>
       {% endif %}
     </div>
   </section>
@@ -184,7 +202,7 @@
   </section>
 </div>
 <script>
-  window.PORTO = {{ {"project": project.project_id, "session": project.session_id, "brainstorm": project.brainstorm_url, "brainstormPage": ("/brainstorm/" ~ (project.project_id | urlencode)) if project.brainstorm_url and not error else "", "error": error} | tojson }};
+  window.PORTO = {{ {"project": project.project_id, "session": project.session_id, "brainstorm": project.brainstorm_url, "brainstormPage": ("/brainstorm/" ~ (project.project_id | urlencode)) if project.brainstorm_url and not error else "", "analysis": project.analysis_url, "analysisPage": ("/analysis/" ~ (project.project_id | urlencode)) if project.analysis_url and not error else "", "error": error, "text": ui_text} | tojson }};
 </script>
 <script src="{{ static_url('editor.js') }}"></script>
 <script src="{{ static_url('app.js') }}"></script>
